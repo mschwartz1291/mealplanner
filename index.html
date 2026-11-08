@@ -404,7 +404,9 @@ function upcomingSunday() {
 }
 
 // ── API ───────────────────────────────────────────────────────────────
-async function callClaude(userMsg, schema) {
+// Streams the response so long answers can't time out, and reports progress
+// through onProgress(charsReceived).
+async function callClaude(userMsg, schema, onProgress) {
   var res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -415,7 +417,11 @@ async function callClaude(userMsg, schema) {
     },
     body: JSON.stringify({
       model: MODEL,
-      max_tokens: 16000,
+      max_tokens: 32000,
+      stream: true,
+      // Thinking off: the plan is mostly writing, and thinking tokens count
+      // against max_tokens (they caused cut-off responses at medium effort).
+      thinking: { type: "disabled" },
       system: SYSTEM_PROMPT,
       output_config: { effort: "medium", format: { type: "json_schema", schema: schema } },
       messages: [{ role: "user", content: userMsg }]
@@ -425,12 +431,38 @@ async function callClaude(userMsg, schema) {
     var err = await res.text();
     throw new Error("API " + res.status + ": " + err.slice(0, 300));
   }
-  var data = await res.json();
-  if (data.stop_reason === "refusal") throw new Error("Claude declined this request. Try again.");
-  if (data.stop_reason === "max_tokens") throw new Error("The response was cut off before it finished. Try again.");
-  var textBlock = (data.content || []).filter(function(b) { return b.type === "text"; })[0];
-  if (!textBlock) throw new Error("Empty response from the API.");
-  return JSON.parse(textBlock.text);
+
+  var reader = res.body.getReader();
+  var decoder = new TextDecoder();
+  var buffer = "", text = "", stopReason = null, outputTokens = 0;
+  function handleEvent(ev) {
+    if (ev.type === "content_block_delta" && ev.delta && ev.delta.type === "text_delta") {
+      text += ev.delta.text;
+      if (onProgress) onProgress(text.length);
+    } else if (ev.type === "message_delta") {
+      if (ev.delta && ev.delta.stop_reason) stopReason = ev.delta.stop_reason;
+      if (ev.usage && ev.usage.output_tokens) outputTokens = ev.usage.output_tokens;
+    } else if (ev.type === "error") {
+      throw new Error("API error: " + ((ev.error && ev.error.message) || "unknown"));
+    }
+  }
+  while (true) {
+    var chunk = await reader.read();
+    if (chunk.done) break;
+    buffer += decoder.decode(chunk.value, { stream: true });
+    var lines = buffer.split("\n");
+    buffer = lines.pop();
+    lines.forEach(function(line) {
+      if (line.indexOf("data:") !== 0) return;
+      var payload = line.slice(5).trim();
+      if (payload) handleEvent(JSON.parse(payload));
+    });
+  }
+
+  if (stopReason === "refusal") throw new Error("Claude declined this request. Try again.");
+  if (stopReason === "max_tokens") throw new Error("The response was cut off after " + outputTokens + " tokens. Try again.");
+  if (!text) throw new Error("Empty response from the API.");
+  return JSON.parse(text);
 }
 
 // ── Context sent with every request ───────────────────────────────────
@@ -475,12 +507,14 @@ async function generatePlan() {
   if (busy !== null) return;
   hideError();
   busy = "plan";
+  document.getElementById("loadingMsg").textContent = "Crafting your meal plan…";
   showScreen("loading");
   var weekOf = upcomingSunday();
   try {
     var result = await callClaude(
       "Generate the 5-day meal plan (Sun-Mon-Tue-Wed-Thu) for the week starting " + weekOf + ".\n" + contextLines(weekOf),
-      PLAN_SCHEMA
+      PLAN_SCHEMA,
+      function(n) { document.getElementById("loadingMsg").textContent = "Writing your meal plan… " + Math.round(n / 1000) + "k characters"; }
     );
     validatePlan(result);
     plan = { weekOf: weekOf, days: result.days, mealPrep: result.mealPrep || [], prepDone: [] };
